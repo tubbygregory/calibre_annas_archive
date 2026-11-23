@@ -6,9 +6,11 @@ Search Anna’s Archive from Calibre’s **Get books** window. The plugin suppor
 
 The plugin targets Calibre 5.0 or later on Windows, macOS, and Linux. The installed ZIP is exercised with offline fixtures in Calibre 5.0 and 9.19 on Linux. CI also runs the native Calibre 9.19 smoke test on Windows and macOS.
 
-1. Build the plugin ZIP below, or download the `calibre-annas-archive-plugin` artifact from the **Artifacts** section of a [GitHub Actions run](https://github.com/tubbygregory/calibre_annas_archive/actions). If GitHub wraps the artifact in another ZIP, extract it and use the inner `calibre_annas_archive-v<VERSION>.zip`.
+1. Build the plugin ZIP below, or download `calibre_annas_archive-v<VERSION>.zip` from the **Artifacts** section of a [GitHub Actions run](https://github.com/tubbygregory/calibre_annas_archive/actions).
 2. In Calibre, go to **Preferences → Plugins → Load plugin from file** and select the plugin ZIP.
 3. Restart Calibre. Open **Get books** and enable **Anna’s Archive** in the list of stores.
+
+If you already downloaded the older `calibre-annas-archive-plugin.zip` artifact, extract `calibre_annas_archive-v<VERSION>.zip` from it and select that file in Calibre.
 
 ## Configuration
 

@@ -109,9 +109,19 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest tests.test_build -v
       - run: python build_plugin.py
-      - uses: actions/upload-artifact@v4
+      - id: upload
+        uses: actions/upload-artifact@v7
         with:
-          name: calibre-annas-archive-plugin
-          path: dist/*.zip
+          path: dist/calibre_annas_archive-v*.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
+      - name: Verify the uploaded ZIP
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          zip_digest="$(sha256sum dist/calibre_annas_archive-v*.zip | cut -d ' ' -f 1)"
+          if [ "$zip_digest" != "${ARTIFACT_DIGEST#sha256:}" ]; then
+            echo "::error::The uploaded artifact must match the installable Calibre ZIP."
+            exit 1
+          fi
