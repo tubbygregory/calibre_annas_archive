@@ -76,7 +76,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$bin\calibre-debug.exe" -e tests/calibre_smoke.py
           exit $LASTEXITCODE
-      - name: Mount and test Calibre on macOS
+      - name: Install and test Calibre on macOS
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -85,8 +85,13 @@ jobs:
           printf '%s  %s\n' '207c80d80ace59cb21a4c52fa1c40843a8e860de100304e590da664db3abfb3f' "$dmg" | shasum -a 256 -c -
           mountpoint="$RUNNER_TEMP/calibre-dmg"
           hdiutil attach "$dmg" -quiet -readonly -nobrowse -mountpoint "$mountpoint"
-          trap 'hdiutil detach "$mountpoint" -quiet' EXIT
-          bin="$mountpoint/calibre.app/Contents/MacOS"
+          trap 'hdiutil detach "$mountpoint" -quiet || true' EXIT
+          app="$RUNNER_TEMP/calibre.app"
+          ditto "$mountpoint/calibre.app" "$app"
+          if hdiutil detach "$mountpoint" -quiet; then
+            trap - EXIT
+          fi
+          bin="$app/Contents/MacOS"
           export CALIBRE_CONFIG_DIRECTORY="$RUNNER_TEMP/calibre-config"
           export CALIBRE_TEMP_DIR="$RUNNER_TEMP/calibre-temp"
           mkdir -p "$CALIBRE_CONFIG_DIRECTORY" "$CALIBRE_TEMP_DIR"
