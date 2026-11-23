@@ -1,197 +1,137 @@
-from contextlib import closing
-from http.client import RemoteDisconnected
-from math import ceil
-from typing import Generator
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
-from urllib.request import urlopen, Request
+"""Calibre store adapter for Anna's Archive."""
 
-from calibre import browser
-from calibre.gui2 import open_url
+import logging
+import re
+from functools import partial
+from html import escape
+from urllib.parse import urljoin
+
+from calibre.ebooks.metadata import check_isbn
+from calibre.gui2 import error_dialog, open_url
 from calibre.gui2.store import StorePlugin
 from calibre.gui2.store.search_result import SearchResult
 from calibre.gui2.store.web_store_dialog import WebStoreDialog
-from calibre_plugins.store_annas_archive.constants import DEFAULT_MIRRORS, RESULTS_PER_PAGE, SearchOption
-from lxml import html
+
+from .downloads import DownloadBrowser, resolve_downloads
+from .http_client import ArchiveError, Deadline, origin, web_url
+from .parsing import download_panel, normalise_formats, read_html, record_path
+from .search import Search
+from .settings import configured_mirrors, link_options
 
 try:
     from qt.core import QUrl
-except (ImportError, ModuleNotFoundError):
-    from PyQt5.Qt import QUrl
+except ImportError:
+    from PyQt5.QtCore import QUrl
 
-SearchResults = Generator[SearchResult, None, None]
+logger = logging.getLogger(__name__)
+DOWNLOAD_PANEL = '#md5-panel-downloads'
 
 
 class AnnasArchiveStore(StorePlugin):
-
     def __init__(self, gui, name, config=None, base_plugin=None):
         super().__init__(gui, name, config, base_plugin)
-        self.working_mirror = None
+        self.backend = Search()
 
-    def _search(self, url: str, max_results: int, timeout: int) -> SearchResults:
-        br = browser()
-        doc = None
-        counter = max_results
+    def search(self, query, max_results=10, timeout=60):
+        # The website redirects hyphenated ISBNs to an unfiltered search.
+        if '-' in query and re.fullmatch(r'[0-9-]+[0-9Xx]', query.strip()):
+            query = check_isbn(query) or query
+        try:
+            for book in self.backend.books(dict(self.config), query, max_results, timeout):
+                result = SearchResult()
+                result.detail_item = urljoin(book.mirror, book.path)
+                result.cover_url = book.cover
+                # Calibre inserts these strings into rich-text cells.
+                result.title = escape(book.title, quote=False)
+                result.author = escape(book.author, quote=False)
+                result.formats = ', '.join(book.formats)
+                result.price = '$0.00'
+                result.drm = SearchResult.DRM_UNKNOWN
+                yield result
+        except ArchiveError as error:
+            logger.warning('Anna’s Archive search [%s]: %s', error.category, error)
+            raise
+        except Exception as error:
+            logger.error('Anna’s Archive search [application]: %s', type(error).__name__)
+            raise
 
-        for page in range(1, ceil(max_results / RESULTS_PER_PAGE) + 1):
-            mirrors = self.config.get('mirrors', DEFAULT_MIRRORS)
-            if self.working_mirror is not None:
-                mirrors.remove(self.working_mirror)
-                mirrors.insert(0, self.working_mirror)
-            for mirror in mirrors:
-                with closing(br.open(url.format(base=mirror, page=page), timeout=timeout)) as resp:
-                    if resp.code < 500 or resp.code > 599:
-                        self.working_mirror = mirror
-                        doc = html.fromstring(resp.read())
-                        break
-            if doc is None:
-                self.working_mirror = None
-                raise Exception('No working mirrors of Anna\'s Archive found.')
+    def _record(self, detail_item, mirrors):
+        path = record_path(detail_item)
+        preferred = self.backend.mirrors.preferred(mirrors)
+        supplied = web_url(detail_item)
+        if supplied and origin(supplied) in mirrors:
+            preferred = origin(supplied)
+        return preferred, path
 
-            books = doc.xpath('//table/tr')
-            for book in books:
-                if counter <= 0:
-                    break
-
-                columns = book.findall("td")
-                s = SearchResult()
-
-                cover = columns[0].xpath('./a[@tabindex="-1"]')
-                if cover:
-                    cover = cover[0]
-                else:
-                    continue
-                s.detail_item = cover.get('href', '').split('/')[-1]
-                if not s.detail_item:
-                    continue
-
-                s.cover_url = ''.join(cover.xpath('(./span/img/@src)[1]'))
-                s.title = ''.join(columns[1].xpath('./a/span/text()'))
-                s.author = ''.join(columns[2].xpath('./a/span/text()'))
-                s.formats = ''.join(columns[9].xpath('./a/span/text()')).upper()
-
-                s.price = '$0.00'
-                s.drm = SearchResult.DRM_UNLOCKED
-
-                counter -= 1
-                yield s
-
-    def search(self, query, max_results=10, timeout=60) -> SearchResults:
-        url = f'{{base}}/search?page={{page}}&q={quote_plus(query)}&display=table'
-        search_opts = self.config.get('search', {})
-        for option in SearchOption.options:
-            value = search_opts.get(option.config_option, ())
-            if isinstance(value, str):
-                value = (value,)
-            for item in value:
-                url += f'&{option.url_param}={item}'
-        yield from self._search(url, max_results, timeout)
-
-    def open(self, parent=None, detail_item=None, external=False):
-        if detail_item:
-            url = self._get_url(detail_item)
-        else:
-            if self.working_mirror is not None:
-                url = self.working_mirror
-            else:
-                url = self.config.get('mirrors', DEFAULT_MIRRORS)[0]
-        if external or self.config.get('open_external', False):
-            open_url(QUrl(url))
-        else:
-            d = WebStoreDialog(self.gui, self.working_mirror, parent, url)
-            d.setWindowTitle(self.name)
-            d.set_tags(self.config.get('tags', ''))
-            d.exec()
-
-    def get_details(self, search_result: SearchResult, timeout=60):
-        if not search_result.formats:
+    def open(self, parent=None, detail_item=None, external=False, *, gui=None):
+        mirrors = configured_mirrors(self.config)
+        mirror, path = self._record(detail_item, mirrors)
+        if not mirror:
+            error_dialog(parent, _('Anna’s Archive'), _('Add a mirror in the plugin preferences.'), show=True)
             return
+        url = urljoin(mirror, path) if path else mirror
+        browser_fallback = isinstance(detail_item, str) and detail_item.endswith(DOWNLOAD_PANEL)
+        if external or self.config.get('open_external', False) or browser_fallback:
+            open_url(QUrl(url + DOWNLOAD_PANEL if browser_fallback and path else url))
+            return
+        dialog = WebStoreDialog(gui or self.gui, mirror, parent, url if path else None)
+        dialog.setWindowTitle(self.name)
+        dialog.set_tags(self.config.get('tags', ''))
+        dialog.exec_()
 
-        _format = '.' + search_result.formats.lower()
+    def get_details(self, search_result, timeout=60):
+        previous_item = search_result.detail_item
+        had_downloads = bool(search_result.downloads)
+        config = dict(self.config)
+        mirrors = configured_mirrors(config)
+        mirror, path = self._record(search_result.detail_item, mirrors)
+        formats = normalise_formats(search_result.formats)
+        search_result.downloads.clear()
+        search_result.create_browser = self.create_browser
+        if mirror and path:
+            search_result.detail_item = urljoin(mirror, path) + DOWNLOAD_PANEL
+        if not mirror or not path or not formats:
+            return had_downloads or search_result.detail_item != previous_item
 
-        link_opts = self.config.get('link', {})
-        url_extension = link_opts.get('url_extension', True)
-        content_type = link_opts.get('content_type', False)
+        deadline = Deadline(timeout)
+        client = self.backend.client
+        options = link_options(config)
 
-        br = browser()
-        with closing(br.open(self._get_url(search_result.detail_item), timeout=timeout)) as f:
-            doc = html.fromstring(f.read())
+        def load(candidate):
+            url = urljoin(candidate, path)
+            with client.open(url, deadline, archive_mirrors=mirrors) as response:
+                destination = response.geturl()
+                if record_path(destination) != path:
+                    raise ArchiveError('parse', 'redirect did not return the requested record')
+                document = read_html(response)
+            download_panel(document)
+            return document, destination
 
-        for link in doc.xpath('//div[@id="md5-panel-downloads"]/ul[contains(@class, "list-inside")]/li/a[contains(@class, "js-download-link")]'):
-            url = link.get('href')
-            link_text = ''.join(link.itertext())
+        try:
+            _, (document, destination) = self.backend.mirrors.fetch(
+                mirrors, 'record', load, deadline, preferred=mirror, track_health=False,
+            )
+            search_result.detail_item = destination + DOWNLOAD_PANEL
+            downloads = resolve_downloads(client, document, destination, formats, options, deadline)
+        except ArchiveError as error:
+            logger.debug('Anna’s Archive record [%s]: %s', error.category, error)
+            return had_downloads or search_result.detail_item != previous_item
+        except Exception as error:
+            logger.error('Anna’s Archive record [application]: %s', type(error).__name__)
+            raise
+        if downloads:
+            search_result.downloads.update(downloads)
+            search_result.detail_item = destination
+            search_result.create_browser = partial(DownloadBrowser, client, downloads, options)
+        return bool(downloads) or had_downloads or search_result.detail_item != previous_item
 
-            if link_text == 'Libgen.li':
-                url = self._get_libgen_link(url, br)
-            elif link_text == 'Libgen.rs Fiction' or link_text == 'Libgen.rs Non-Fiction':
-                url = self._get_libgen_nonfiction_link(url, br)
-            elif link_text.startswith('Sci-Hub'):
-                url = self._get_scihub_link(url, br)
-            elif link_text == 'Z-Library':
-                url = self._get_zlib_link(url, br)
-            else:
-                continue
-
-            if not url:
-                continue
-
-            # Takes longer, but more accurate
-            if content_type:
-                try:
-                    with urlopen(Request(url, method='HEAD'), timeout=timeout) as resp:
-                        if resp.info().get_content_maintype() != 'application':
-                            continue
-                except (HTTPError, URLError, TimeoutError, RemoteDisconnected):
-                    pass
-            elif url_extension:
-                # Speeds it up by checking the extension of the url.
-                # Might miss a direct url that doesn't end with the extension
-                params = url.find("?")
-                if params < 0:
-                    params = None
-                if url.endswith(_format, 0, params):
-                    continue
-            search_result.downloads[f"{link_text}.{search_result.formats}"] = url
-
-    @staticmethod
-    def _get_libgen_link(url: str, br) -> str:
-        with closing(br.open(url)) as resp:
-            doc = html.fromstring(resp.read())
-            scheme, _, host, _ = resp.geturl().split('/', 3)
-        url = ''.join(doc.xpath('//a[h2[text()="GET"]]/@href'))
-        return f"{scheme}//{host}/{url}"
-
-    @staticmethod
-    def _get_libgen_nonfiction_link(url: str, br) -> str:
-        with closing(br.open(url)) as resp:
-            doc = html.fromstring(resp.read())
-        url = ''.join(doc.xpath('//h2/a[text()="GET"]/@href'))
-        return url
-
-    @staticmethod
-    def _get_scihub_link(url, br):
-        with closing(br.open(url)) as resp:
-            doc = html.fromstring(resp.read())
-            scheme, _ = resp.geturl().split('/', 1)
-        url = ''.join(doc.xpath('//embed[@id="pdf"]/@src'))
-        if url:
-            return scheme + url
-
-    @staticmethod
-    def _get_zlib_link(url, br):
-        with closing(br.open(url)) as resp:
-            doc = html.fromstring(resp.read())
-            scheme, _, host, _ = resp.geturl().split('/', 3)
-        url = ''.join(doc.xpath('//a[contains(@class, "addDownloadedBook")]/@href'))
-        if url:
-            return f"{scheme}//{host}/{url}"
-
-    def _get_url(self, md5):
-        return f"{self.working_mirror}/md5/{md5}"
+    def customization_help(self, gui=False):
+        return _('Set search filters, mirror priority, and download preferences for Anna’s Archive.')
 
     def config_widget(self):
-        from calibre_plugins.store_annas_archive.config import ConfigWidget
+        from .config import ConfigWidget
         return ConfigWidget(self)
 
     def save_settings(self, config_widget):
         config_widget.save_settings()
+        self.backend.reset()
