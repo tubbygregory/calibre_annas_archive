@@ -6,7 +6,7 @@ Search Anna’s Archive from Calibre’s **Get books** window. The plugin suppor
 
 The plugin targets Calibre 5.0 or later on Windows, macOS, and Linux. The ZIP was installed and exercised with offline fixtures in Calibre 5.0 and 9.19 on Linux. The Windows and macOS CI jobs cover the Python backend.
 
-1. Build the plugin ZIP below, or download the `calibre-annas-archive-plugin` artifact from a successful [GitHub Actions run](https://github.com/tubbygregory/calibre_annas_archive/actions). If GitHub wraps the artifact in another ZIP, extract it and use the inner `calibre_annas_archive-v<VERSION>.zip`.
+1. Build the plugin ZIP below, or download the `calibre-annas-archive-plugin` artifact from the **Artifacts** section of a [GitHub Actions run](https://github.com/tubbygregory/calibre_annas_archive/actions). If GitHub wraps the artifact in another ZIP, extract it and use the inner `calibre_annas_archive-v<VERSION>.zip`.
 2. In Calibre, go to **Preferences → Plugins → Load plugin from file** and select the plugin ZIP.
 3. Restart Calibre. Open **Get books** and enable **Anna’s Archive** in the list of stores.
 
@@ -48,7 +48,7 @@ python -m compileall -q .
 python -m unittest discover -v
 ```
 
-CI checks syntax and runs the offline tests on Linux, Windows, and macOS, then builds the ZIP. The hosted jobs use the system Python and omit Calibre and Qt. To reproduce the offline integration check with a Calibre installation, use an empty Calibre configuration directory and run the following commands from the checkout. This example uses a POSIX shell.
+CI checks syntax and runs the offline tests on Linux, Windows, and macOS. It also checks ZIP reproducibility and uploads the build. The hosted jobs use the system Python and omit Calibre and Qt. To reproduce the offline integration check with a Calibre installation, use an empty Calibre configuration directory and run the following commands from the checkout. This example uses a POSIX shell.
 
 ```sh
 export CALIBRE_CONFIG_DIRECTORY="$(mktemp -d)"
