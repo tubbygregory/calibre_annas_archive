@@ -35,6 +35,64 @@ jobs:
       - run: python -m compileall -q .
       - run: python -m unittest discover -v
 
+  calibre-smoke:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      CALIBRE_VERSION: '9.19.0'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python build_plugin.py
+      - name: Install and test Calibre on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP calibre.msi
+          $url = "https://download.calibre-ebook.com/$env:CALIBRE_VERSION/calibre-64bit-$env:CALIBRE_VERSION.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          $expected = '241193d5045bdcbc3e7ec000c22ede0b5da1fd2e91e83fa0b17f0e1f67174480'
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Calibre MSI checksum mismatch'
+          }
+          $installer = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($installer.ExitCode -notin @(0, 3010)) {
+            throw "Calibre installer exited with $($installer.ExitCode)"
+          }
+          $bin = Join-Path $env:ProgramFiles Calibre2
+          $env:CALIBRE_CONFIG_DIRECTORY = Join-Path $env:RUNNER_TEMP calibre-config
+          $env:CALIBRE_TEMP_DIR = Join-Path $env:RUNNER_TEMP calibre-temp
+          New-Item -ItemType Directory -Force $env:CALIBRE_CONFIG_DIRECTORY, $env:CALIBRE_TEMP_DIR | Out-Null
+          $zip = Get-ChildItem dist -Filter '*.zip' | Select-Object -First 1
+          & "$bin\calibre-customize.exe" -a $zip.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$bin\calibre-debug.exe" -e tests/calibre_smoke.py
+          exit $LASTEXITCODE
+      - name: Mount and test Calibre on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dmg="$RUNNER_TEMP/calibre.dmg"
+          curl -fsSL --retry 3 "https://download.calibre-ebook.com/$CALIBRE_VERSION/calibre-$CALIBRE_VERSION.dmg" -o "$dmg"
+          printf '%s  %s\n' '207c80d80ace59cb21a4c52fa1c40843a8e860de100304e590da664db3abfb3f' "$dmg" | shasum -a 256 -c -
+          mountpoint="$RUNNER_TEMP/calibre-dmg"
+          hdiutil attach "$dmg" -quiet -readonly -nobrowse -mountpoint "$mountpoint"
+          trap 'hdiutil detach "$mountpoint" -quiet' EXIT
+          bin="$mountpoint/calibre.app/Contents/MacOS"
+          export CALIBRE_CONFIG_DIRECTORY="$RUNNER_TEMP/calibre-config"
+          export CALIBRE_TEMP_DIR="$RUNNER_TEMP/calibre-temp"
+          mkdir -p "$CALIBRE_CONFIG_DIRECTORY" "$CALIBRE_TEMP_DIR"
+          "$bin/calibre-customize" -a dist/*.zip
+          "$bin/calibre-debug" -e tests/calibre_smoke.py
+
   package:
     runs-on: ubuntu-latest
     steps:
