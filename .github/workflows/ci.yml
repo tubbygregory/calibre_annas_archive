@@ -22,7 +22,7 @@ jobs:
             python: '3.12'
           - os: windows-latest
             python: '3.12'
-          - os: macos-latest
+          - os: macos-15-intel
             python: '3.12'
     steps:
       - uses: actions/checkout@v6
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-15-intel]
     env:
       CALIBRE_VERSION: '9.19.0'
     steps:
