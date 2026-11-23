@@ -1,3 +1,4 @@
+import hashlib
 import io
 import unittest
 from email.message import Message
@@ -8,7 +9,7 @@ from tests.support import EPUB, MIRROR, PDF, FakeResponse, fixture
 
 from calibre_plugins.store_annas_archive.downloads import DownloadBrowser, resolve_downloads, url_extension, verified_format
 from calibre_plugins.store_annas_archive.http_client import ArchiveError, Deadline, HttpClient, mirror_url, web_url
-from calibre_plugins.store_annas_archive.parsing import parse_html
+from calibre_plugins.store_annas_archive.parsing import MAX_COVER_BYTES, fetch_cover, parse_html
 
 STRICT = {'url_extension': True, 'content_type': True}
 DEFAULT = {'url_extension': True, 'content_type': False}
@@ -41,7 +42,7 @@ class HttpClientTest(unittest.TestCase):
         self.opener.open.side_effect = HTTPError(MIRROR, 403, 'untrusted details', Message(), body)
         with self.assertRaises(ArchiveError) as error:
             self.client.open(MIRROR, self.deadline)
-        self.assertEqual((error.exception.category, str(error.exception)), ('restriction', 'HTTP 403'))
+        self.assertEqual((error.exception.category, str(error.exception)), ('restriction', 'HTTP 403 (access denied)'))
         self.assertTrue(body.closed)
 
     def test_safe_redirects_do_not_follow_unsafe_or_unconfigured_locations(self):
@@ -164,3 +165,76 @@ class DownloadTest(unittest.TestCase):
             self.assertEqual(stream.read(), PDF)
         with self.assertRaisesRegex(ArchiveError, 'File link is no longer available'):
             browser.open(url)
+
+    def test_explicitly_expired_link_refreshes_once(self):
+        old = MIRROR + '/download?key=old'
+        new = MIRROR + '/download?key=new'
+        expired = b'<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>'
+        self.opener.open.side_effect = [
+            FakeResponse(old, expired, code=403, content_type='application/xml'),
+            FakeResponse(new, PDF, content_type='application/pdf'),
+        ]
+        refresh = Mock(return_value=new)
+        browser = DownloadBrowser(self.client, {'PDF': old}, STRICT, refresh=refresh)
+        with browser.open(old) as stream:
+            self.assertEqual(stream.read(), PDF)
+        refresh.assert_called_once()
+        self.assertEqual(refresh.call_args.args[0], 'PDF')
+        self.assertEqual([call.args[0].full_url for call in self.opener.open.call_args_list], [old, new])
+
+        refresh.reset_mock()
+        self.opener.open.side_effect = [
+            FakeResponse(url, code=403, headers={'X-Amz-Error-Code': 'ExpiredToken'}) for url in (old, new)
+        ]
+        with self.assertRaisesRegex(ArchiveError, 'expired'):
+            browser.open(old)
+        refresh.assert_called_once()
+
+    def test_sign_in_and_verification_responses_never_refresh(self):
+        url = MIRROR + '/download?key=old'
+        responses = (
+            FakeResponse(url, b'<title>Sign in</title>', code=403),
+            FakeResponse(url, code=403, headers={'CF-Mitigated': 'challenge', 'X-Amz-Error-Code': 'ExpiredToken'}),
+        )
+        refresh = Mock()
+        browser = DownloadBrowser(self.client, {'PDF': url}, STRICT, refresh=refresh)
+        for response in responses:
+            with self.subTest(response=response):
+                self.opener.open.return_value = response
+                with self.assertRaises(ArchiveError) as error:
+                    browser.open(url)
+                self.assertEqual(error.exception.category, 'restriction')
+                self.assertTrue(response.closed)
+        refresh.assert_not_called()
+
+    def test_file_stream_checks_length_and_record_hash(self):
+        url = MIRROR + '/book.pdf'
+        content = PDF * 100
+        digest = hashlib.md5(content).hexdigest()
+        browser = DownloadBrowser(self.client, {'PDF': url}, STRICT, expected_md5=digest)
+        self.opener.open.side_effect = [
+            FakeResponse(url, data, content_type='application/pdf', headers={'Content-Length': str(len(content))})
+            for data in (content, content[:-1], content[:-1] + b'x')
+        ]
+        with browser.open(url) as stream:
+            self.assertEqual(stream.read(0), b'')
+            self.assertEqual(stream.read(20) + stream.read(1000) + stream.read(), content)
+        with browser.open(url) as stream, self.assertRaisesRegex(ArchiveError, 'length'):
+            while stream.read(400):
+                pass
+        with browser.open(url) as stream, self.assertRaisesRegex(ArchiveError, 'record'):
+            stream.read()
+
+    def test_cover_uses_guarded_get_and_rejects_html_or_large_responses(self):
+        url = MIRROR + '/covers/book.png'
+        jpeg_url = 'https://covers.example/image.jpg'
+        jpeg = b'\xff\xd8\xffsynthetic'
+        self.opener.open.side_effect = [
+            FakeResponse(url, code=302, headers={'Location': jpeg_url}),
+            FakeResponse(jpeg_url, jpeg, content_type='image/jpeg'),
+            FakeResponse(url, b'<title>Sign in</title>', content_type='image/png'),
+            FakeResponse(url, b'\x89PNG\r\n\x1a\n' + b'x' * MAX_COVER_BYTES, content_type='image/png'),
+        ]
+        self.assertEqual(fetch_cover(self.client, url, self.deadline), jpeg)
+        self.assertIsNone(fetch_cover(self.client, url, self.deadline))
+        self.assertIsNone(fetch_cover(self.client, url, self.deadline))

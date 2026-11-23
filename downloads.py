@@ -1,5 +1,6 @@
 """Resolve and verify public ebook links from an Archive record."""
 
+import hashlib
 import logging
 import re
 from urllib.parse import unquote, urlsplit
@@ -197,26 +198,102 @@ def resolve_downloads(client, document, page_url, formats, options, deadline):
     return downloads
 
 
+class _VerifiedFile:
+    """Replay the sample and verify the complete file as Calibre copies it."""
+
+    def __init__(self, response, prefix, expected_md5):
+        self.response = response
+        self.prefix = prefix
+        self.expected_md5 = expected_md5
+        self.total = 0
+        self.digest = None
+        if expected_md5:
+            try:
+                self.digest = hashlib.md5(usedforsecurity=False)
+            except TypeError:
+                # Python 3.8 in Calibre 5 predates the usedforsecurity argument.
+                self.digest = hashlib.md5()
+        length = response.headers.get('Content-Length')
+        if length is not None and not re.fullmatch(r'[0-9]{1,20}', length.strip()):
+            raise ArchiveError('integrity', 'download returned an invalid Content-Length')
+        self.length = int(length) if length is not None else None
+
+    def read(self, size=-1):
+        if size == 0:
+            return b''
+        if size is None or size < 0:
+            data = self.prefix + read_body(self.response, -1)
+            self.prefix = b''
+        else:
+            data, self.prefix = self.prefix[:size], self.prefix[size:]
+            if len(data) < size:
+                data += read_body(self.response, size - len(data))
+        self.total += len(data)
+        if self.digest:
+            self.digest.update(data)
+        if not data or size is None or size < 0 or self.total == self.length:
+            if self.length is not None and self.total != self.length:
+                raise ArchiveError('integrity', 'download is incomplete or has an unexpected length')
+            if self.digest and self.digest.hexdigest() != self.expected_md5:
+                raise ArchiveError('integrity', 'download does not match the Archive record')
+        elif self.length is not None and self.total > self.length:
+            raise ArchiveError('integrity', 'download exceeds the advertised length')
+        return data
+
+    def info(self):
+        return self.response.headers
+
+    def geturl(self):
+        return self.response.geturl()
+
+    def close(self):
+        self.response.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+
 class DownloadBrowser:
     """The browser methods Calibre uses when downloading a search result."""
 
-    def __init__(self, client, downloads, options):
+    def __init__(self, client, downloads, options, *, refresh=None, expected_md5=None):
         self.client = client
         self.formats = {url: fmt for fmt, url in downloads.items()}
         self.options = options
+        self.refresh = refresh
+        self.expected_md5 = expected_md5
 
     def set_debug_http(self, enabled):
         # Calibre enables raw HTTP debugging on its browser. URLs may be signed.
         pass
 
-    def open(self, url):
-        response = self.client.open(url, Deadline(30))
+    def _open_file(self, url, formats, deadline):
+        response = self.client.open(url, deadline, file_download=True)
         try:
-            prefix = response.peek(SAMPLE_SIZE)[:SAMPLE_SIZE]
-            fmt = self.formats.get(url)
-            if not verified_format(response, prefix, (fmt,) if fmt else FORMATS, self.options):
+            prefix = read_body(response, SAMPLE_SIZE)
+            if not verified_format(response, prefix, formats, self.options):
                 raise ArchiveError('restriction', 'File link is no longer available. Open the record in your browser.')
+            return _VerifiedFile(response, prefix, self.expected_md5)
         except Exception:
             response.close()
             raise
-        return response
+
+    def open(self, url):
+        fmt = self.formats.get(url)
+        formats = (fmt,) if fmt else FORMATS
+        deadline = Deadline(30)
+        try:
+            return self._open_file(url, formats, deadline)
+        except ArchiveError as error:
+            if error.category != 'expired' or not self.refresh or not fmt:
+                raise
+        try:
+            replacement = self.refresh(fmt, deadline)
+        except ArchiveError:
+            replacement = None
+        if not replacement:
+            raise ArchiveError('expired', 'File link has expired. Open the record in your browser.')
+        return self._open_file(replacement, formats, deadline)

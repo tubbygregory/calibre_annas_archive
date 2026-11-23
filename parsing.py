@@ -20,6 +20,12 @@ NEXT_LINKS = (
     '//a[@href and (contains(concat(" ", normalize-space(@rel), " "), " next ")'
     ' or contains(@class, "js-pagination-next-page") or ancestor::nav[@aria-label="Pagination"])]'
 )
+MAX_COVER_BYTES = 1024 * 1024
+COVER_SIGNATURES = {
+    'image/jpeg': (b'\xff\xd8\xff',),
+    'image/png': (b'\x89PNG\r\n\x1a\n',),
+    'image/gif': (b'GIF87a', b'GIF89a'),
+}
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,24 @@ def _cover(images, base):
         if cover and (urlsplit(base).scheme != 'https' or urlsplit(cover).scheme == 'https'):
             return cover
     return ''
+
+
+def fetch_cover(client, url, deadline):
+    """Fetch a bounded raster cover through the guarded HTTP client."""
+    with client.open(url, deadline) as response:
+        media = response.headers.get_content_type()
+        if media not in COVER_SIGNATURES and media not in {'image/webp', 'application/octet-stream'}:
+            return None
+        image = read_body(response, MAX_COVER_BYTES + 1)
+    if len(image) > MAX_COVER_BYTES:
+        return None
+    if media in COVER_SIGNATURES:
+        return image if image.startswith(COVER_SIGNATURES[media]) else None
+    if image.startswith(b'RIFF') and image[8:12] == b'WEBP':
+        return image
+    if media == 'application/octet-stream' and any(image.startswith(prefix) for prefix in COVER_SIGNATURES.values()):
+        return image
+    return None
 
 
 def _card_books(root, base):
