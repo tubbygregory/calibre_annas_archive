@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><title>Search · Anna's Archive</title><meta charset="utf-8"></head>
+<body>
+<form action="/search" class="js-search-form"><input type="search" name="q" value="library"></form>
+<div id="aarecord-list">
+<table>
+<thead><tr><th id="name">Title</th><th id="format">File format</th><th id="writer">Author</th><th>Cover</th></tr></thead>
+<tbody>
+<tr><td headers="name"><a href="/md5/11111111111111111111111111111111"><em>A</em> library &amp; its history</a></td>
+<td headers="format">.pdf</td><td headers="writer">Ada Example</td>
+<td><img data-src="/covers/library.jpg"></td></tr>
+<tr><td headers="name"><a href="/md5/22222222222222222222222222222222">The second book</a></td>
+<td headers="format">EpUb</td></tr>
+<tr><td headers="name"></td><td headers="format">PDF</td><td><a href="/md5/44444444444444444444444444444444"><img src="/cover.png"></a></td></tr>
+<tr><td headers="name"><a href="/md5/missing">Bad record ID</a></td></tr>
+<tr><td headers="name"><a href="https://other.example/md5/44444444444444444444444444444444">Off-site record</a></td></tr>
+<tr><td>Unrelated row</td></tr>
+<tr><td headers="name"><a href="/md5/11111111111111111111111111111111?view=table">Redundant listing</a></td></tr>
+</tbody>
+</table>
+</div>
+<nav aria-label="Pagination">
+<a href="/search?q=library&amp;page=1" aria-current="page">1</a>
+<a href="?page=2" class="js-pagination-next-page">Next</a>
+<a href="https://unconfigured.example/search?page=2" rel="next">Untrusted</a>
+</nav>
+</body>
+</html>
