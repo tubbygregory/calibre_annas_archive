@@ -13,10 +13,11 @@ from calibre.gui2.store.search_result import SearchResult
 from calibre.gui2.store.web_store_dialog import WebStoreDialog
 
 from .downloads import DownloadBrowser, resolve_downloads
-from .http_client import ArchiveError, Deadline, origin, web_url
-from .parsing import download_panel, normalise_formats, read_html, record_path
-from .search import Search
-from .settings import configured_mirrors, link_options
+from .feedback import SearchFeedback
+from .http_client import ArchiveError, Deadline, InFlightLookups, origin, web_url
+from .parsing import download_panel, fetch_cover, normalise_formats, read_html, record_path
+from .search import Search, search_url
+from .settings import configured_mirrors, link_options, search_options
 
 try:
     from qt.core import QUrl
@@ -31,16 +32,21 @@ class AnnasArchiveStore(StorePlugin):
     def __init__(self, gui, name, config=None, base_plugin=None):
         super().__init__(gui, name, config, base_plugin)
         self.backend = Search()
+        self.feedback = SearchFeedback()
+        self.lookups = InFlightLookups()
 
     def search(self, query, max_results=10, timeout=60):
         # The website redirects hyphenated ISBNs to an unfiltered search.
         if '-' in query and re.fullmatch(r'[0-9-]+[0-9Xx]', query.strip()):
             query = check_isbn(query) or query
+        config = dict(self.config)
+        search_number = self.feedback.start()
         try:
-            for book in self.backend.books(dict(self.config), query, max_results, timeout):
+            for book in self.backend.books(config, query, max_results, timeout):
                 result = SearchResult()
                 result.detail_item = urljoin(book.mirror, book.path)
-                result.cover_url = book.cover
+                # Pass cover bytes via get_details so Calibre does not open an unchecked URL.
+                result._archive_cover_url = book.cover
                 # Calibre inserts these strings into rich-text cells.
                 result.title = escape(book.title, quote=False)
                 result.author = escape(book.author, quote=False)
@@ -50,6 +56,9 @@ class AnnasArchiveStore(StorePlugin):
                 yield result
         except ArchiveError as error:
             logger.warning('Anna’s Archive search [%s]: %s', error.category, error)
+            mirror = self.backend.mirrors.preferred(configured_mirrors(config))
+            browser_url = search_url(mirror, query.strip(), 1, search_options(config)) if mirror else ''
+            self.feedback.changed.emit(search_number, str(error), browser_url)
             raise
         except Exception as error:
             logger.error('Anna’s Archive search [application]: %s', type(error).__name__)
@@ -79,23 +88,8 @@ class AnnasArchiveStore(StorePlugin):
         dialog.set_tags(self.config.get('tags', ''))
         dialog.exec_()
 
-    def get_details(self, search_result, timeout=60):
-        previous_item = search_result.detail_item
-        had_downloads = bool(search_result.downloads)
-        config = dict(self.config)
-        mirrors = configured_mirrors(config)
-        mirror, path = self._record(search_result.detail_item, mirrors)
-        formats = normalise_formats(search_result.formats)
-        search_result.downloads.clear()
-        search_result.create_browser = self.create_browser
-        if mirror and path:
-            search_result.detail_item = urljoin(mirror, path) + DOWNLOAD_PANEL
-        if not mirror or not path or not formats:
-            return had_downloads or search_result.detail_item != previous_item
-
-        deadline = Deadline(timeout)
+    def _load_record(self, mirrors, preferred, path, formats, options, deadline):
         client = self.backend.client
-        options = link_options(config)
 
         def load(candidate):
             url = urljoin(candidate, path)
@@ -107,23 +101,70 @@ class AnnasArchiveStore(StorePlugin):
             download_panel(document)
             return document, destination
 
+        _, (document, destination) = self.backend.mirrors.fetch(
+            mirrors, 'record', load, deadline, preferred=preferred, track_health=False,
+        )
+        return destination, resolve_downloads(client, document, destination, formats, options, deadline)
+
+    def _record_downloads(self, mirrors, mirror, path, formats, options, deadline):
+        key = (mirrors, mirror, path, formats, tuple(options.items()))
+        return self.lookups.run(
+            key, deadline, partial(self._load_record, mirrors, mirror, path, formats, options, deadline),
+        )
+
+    def _update_cover(self, result, deadline):
+        url = getattr(result, '_archive_cover_url', '')
+        if not url or result.cover_data or not deadline.remaining():
+            return False
+        cover_deadline = Deadline(min(3, deadline.remaining()))
         try:
-            _, (document, destination) = self.backend.mirrors.fetch(
-                mirrors, 'record', load, deadline, preferred=mirror, track_health=False,
+            result.cover_data = self.lookups.run(
+                ('cover', url), cover_deadline, partial(fetch_cover, self.backend.client, url, cover_deadline),
             )
+        except ArchiveError as error:
+            logger.debug('Anna’s Archive cover [%s]: %s', error.category, error)
+        return bool(result.cover_data)
+
+    def get_details(self, search_result, timeout=60):
+        deadline = Deadline(timeout)
+        cover_changed = self._update_cover(search_result, deadline)
+        previous_item = search_result.detail_item
+        had_downloads = bool(search_result.downloads)
+        config = dict(self.config)
+        mirrors = configured_mirrors(config)
+        mirror, path = self._record(search_result.detail_item, mirrors)
+        formats = normalise_formats(search_result.formats)
+        search_result.downloads.clear()
+        search_result.create_browser = self.create_browser
+        if mirror and path:
+            search_result.detail_item = urljoin(mirror, path) + DOWNLOAD_PANEL
+        changed = cover_changed or had_downloads or search_result.detail_item != previous_item
+        if not mirror or not path or not formats:
+            return changed
+
+        options = link_options(config)
+        try:
+            destination, downloads = self._record_downloads(mirrors, mirror, path, formats, options, deadline)
             search_result.detail_item = destination + DOWNLOAD_PANEL
-            downloads = resolve_downloads(client, document, destination, formats, options, deadline)
         except ArchiveError as error:
             logger.debug('Anna’s Archive record [%s]: %s', error.category, error)
-            return had_downloads or search_result.detail_item != previous_item
+            return changed
         except Exception as error:
             logger.error('Anna’s Archive record [application]: %s', type(error).__name__)
             raise
         if downloads:
             search_result.downloads.update(downloads)
             search_result.detail_item = destination
-            search_result.create_browser = partial(DownloadBrowser, client, downloads, options)
-        return bool(downloads) or had_downloads or search_result.detail_item != previous_item
+
+            def refresh(fmt, budget):
+                _, updated = self._record_downloads(mirrors, mirror, path, (fmt,), options, budget)
+                return updated.get(fmt)
+
+            expected_md5 = path.rsplit('/', 1)[1] if path.startswith('/md5/') else None
+            search_result.create_browser = partial(
+                DownloadBrowser, self.backend.client, downloads, options, refresh=refresh, expected_md5=expected_md5,
+            )
+        return bool(downloads) or changed or search_result.detail_item != previous_item
 
     def customization_help(self, gui=False):
         return _('Set search filters, mirror priority, and download preferences for Anna’s Archive.')

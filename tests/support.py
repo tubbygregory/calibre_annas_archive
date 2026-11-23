@@ -38,6 +38,3 @@ class FakeResponse(io.BytesIO):
 
     def geturl(self):
         return self.url
-
-    def peek(self, amount):
-        return self.getbuffer()[self.tell():self.tell() + amount].tobytes()

@@ -12,6 +12,7 @@ FILES = (
     'config.py',
     'constants.py',
     'downloads.py',
+    'feedback.py',
     'http_client.py',
     'mirrors.py',
     'parsing.py',
